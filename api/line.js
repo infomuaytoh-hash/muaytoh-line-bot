@@ -1,13 +1,18 @@
-const express = require('express');
-const cors = require('cors');
-const fetch = require('node-fetch');
+export default async function handler(req, res) {
+    res.setHeader('Access-Control-Allow-Credentials', true);
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
+    res.setHeader('Access-Control-Allow-Headers', 'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version, Authorization');
 
-const app = express();
+    if (req.method === 'OPTIONS') {
+        res.status(200).end();
+        return;
+    }
 
-app.use(cors());
-app.use(express.json());
+    if (req.method !== 'POST') {
+        return res.status(405).json({ error: 'Method Not Allowed' });
+    }
 
-app.post('/api/line', async (req, res) => {
     const { token, to, message } = req.body;
 
     if (!token || !to || !message) {
@@ -38,6 +43,4 @@ app.post('/api/line', async (req, res) => {
         console.error('Server Error:', error);
         res.status(500).json({ success: false, error: 'ระบบเซิร์ฟเวอร์ขัดข้อง' });
     }
-});
-
-module.exports = app;
+}
