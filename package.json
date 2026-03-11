@@ -1,0 +1,14 @@
+{
+  "name": "muaytoh-line-bot",
+  "version": "1.0.0",
+  "description": "Backend for LINE Messaging API",
+  "main": "api/line.js",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "node-fetch": "^2.7.0"
+  },
+  "engines": {
+    "node": "18.x"
+  }
+}
