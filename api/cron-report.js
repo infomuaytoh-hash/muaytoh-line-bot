@@ -1,4 +1,3 @@
-// api/cron-report.js
 import admin from 'firebase-admin';
 
 // 1. กำหนดค่า Firebase Admin SDK (ต้องใส่ ENV ใน Vercel)
@@ -7,7 +6,6 @@ if (!admin.apps.length) {
     credential: admin.credential.cert({
       projectId: process.env.FIREBASE_PROJECT_ID,
       clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-      // ระวังเรื่อง \n ใน Private Key บน Vercel
       privateKey: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
     }),
   });
@@ -16,16 +14,19 @@ if (!admin.apps.length) {
 const db = admin.firestore();
 
 export default async function handler(req, res) {
-  // (Optional) ตรวจสอบว่าเรียกมาจาก Vercel Cron จริงๆ เพื่อความปลอดภัย
+  // ตรวจสอบว่าเรียกมาจาก Vercel Cron/cron-job.org จริงๆ เพื่อความปลอดภัย
   if (req.headers.authorization !== `Bearer ${process.env.CRON_SECRET}`) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
 
   try {
-    // 2. ดึงเวลาปัจจุบันของประเทศไทย (HH:mm)
-    const options = { timeZone: 'Asia/Bangkok', hour: '2-digit', minute: '2-digit', hour12: false };
-    const formatter = new Intl.DateTimeFormat('en-US', options);
-    const currentTimeStr = formatter.format(new Date()); // ตัวอย่างผลลัพธ์: "23:30"
+    // === [เวทมนตร์ 1] ดึงเวลาไทยแบบชัวร์ 100% ไม่แคร์ Vercel ===
+    const now = new Date();
+    const bkkStr = now.toLocaleString("en-US", { timeZone: "Asia/Bangkok" });
+    const bkkDate = new Date(bkkStr);
+    const currentHour = String(bkkDate.getHours()).padStart(2, '0');
+    const currentMinute = String(bkkDate.getMinutes()).padStart(2, '0');
+    const currentTimeStr = `${currentHour}:${currentMinute}`; // ได้ออกมาเป็น HH:mm เป๊ะๆ
 
     const hqAppId = 'muaytoh-stock';
     
@@ -49,8 +50,8 @@ export default async function handler(req, res) {
 
       console.log(`[${brand.name}] ถึงเวลาส่งรายงานรอบ: ${matchedShift.name} (${currentTimeStr})`);
 
-      // 6. สร้างและส่งรายงาน (ดูฟังก์ชันด้านล่าง)
-      await generateAndSendReport(branchId, brand.name, config, matchedShift.name);
+      // 6. ส่ง bkkDate ไปให้ฟังก์ชันด้านล่างใช้ด้วย
+      await generateAndSendReport(branchId, brand.name, config, matchedShift.name, bkkDate);
     }
 
     res.status(200).json({ success: true, message: `Cron check completed for ${currentTimeStr}` });
@@ -62,22 +63,27 @@ export default async function handler(req, res) {
 }
 
 // ฟังก์ชันสำหรับคำนวณและส่ง LINE
-async function generateAndSendReport(branchId, branchName, config, shiftName) {
-  const startOfDay = new Date();
-  startOfDay.setHours(0, 0, 0, 0); // รีเซ็ตเวลาเป็นเที่ยงคืนของวันนี้
+async function generateAndSendReport(branchId, branchName, config, shiftName, bkkDate) {
+  
+  // === [เวทมนตร์ 2] คำนวณหา timestamp เที่ยงคืนของประเทศไทยเป๊ะๆ ===
+  const BKK_OFFSET = 7 * 60 * 60 * 1000; // +7 ชั่วโมง
+  const nowTime = new Date().getTime();
+  const nowBkkTime = nowTime + BKK_OFFSET;
+  const startOfDayBkkShifted = nowBkkTime - (nowBkkTime % (24 * 60 * 60 * 1000)); // ปัดเศษลงหาเที่ยงคืน
+  const startOfDayTimestamp = startOfDayBkkShifted - BKK_OFFSET; // แปลงกลับเป็นค่า Time จริงที่ฐานข้อมูลเข้าใจ
 
   // ดึงข้อมูล Inventory
   const invSnap = await db.collection(`artifacts/${branchId}/public/data/inventory`).get();
   const items = invSnap.docs.map(d => d.data());
   const activeItems = items.filter(i => i.isActive !== false);
 
-  // ดึงข้อมูล Transactions (เอาเฉพาะของวันนี้)
+  // ดึงข้อมูล Transactions (เอาเฉพาะของวันนี้ตามเวลาไทย)
   const logsSnap = await db.collection(`artifacts/${branchId}/public/data/transactions`)
-    .where('timestamp', '>=', startOfDay.getTime())
+    .where('timestamp', '>=', startOfDayTimestamp)
     .get();
   const logs = logsSnap.docs.map(d => d.data());
 
-  // === เริ่มคำนวณ (ถอดลอจิกมาจากฝั่ง Frontend) ===
+  // === เริ่มคำนวณยอดขาย ===
   const itemPriceMap = {};
   items.forEach(i => { itemPriceMap[i.name] = parseFloat(i.price) || 0; });
 
@@ -124,16 +130,20 @@ async function generateAndSendReport(branchId, branchName, config, shiftName) {
       orderSummary = `\n✅ วันนี้ไม่มีรายการที่ต้องสั่งซื้อเพิ่ม`;
   }
 
+  // === [เวทมนตร์ 3] บังคับให้วันที่เป็นปี พ.ศ. ของไทย ===
+  const day = bkkDate.getDate().toString().padStart(2, '0');
+  const month = (bkkDate.getMonth() + 1).toString().padStart(2, '0');
+  const year = bkkDate.getFullYear() + 543;
+  const todayDate = `${day}/${month}/${year}`;
+
   // === สร้างข้อความรายงาน ===
-  const todayDate = new Date().toLocaleDateString('th-TH');
   const message = `\n[📍 สาขา: ${branchName}]\n📊 สรุปรายงานรอบ: ${shiftName}\n📅 ประจำวันที่: ${todayDate}\n\n🍽️ ยอดขายผ่านระบบ: ${totalSalesCount} จาน/รายการ\n📤 ยอดเบิกใช้รวม: ฿${totalUsageCost.toLocaleString(undefined, {minimumFractionDigits:2})}\n🗑️ มูลค่าของเสียรวม: ฿${totalWasteCost.toLocaleString(undefined, {minimumFractionDigits:2})}\n🚨 ของเสียเยอะสุด: ${topWasteText}\n\n---\n📋 สรุปสั่งซื้อ${orderSummary}\n💰 งบสั่งซื้อที่ต้องเตรียม: ฿${restockBudget.toLocaleString(undefined, {minimumFractionDigits:2})}`;
 
   // === ยิงเข้า LINE ===
   const activeGroups = (config.lineGroups || []).filter(g => g.active);
   for (const group of activeGroups) {
     try {
-      // ยิงข้อความด้วย LINE Messaging API โดยตรง หรือเรียกผ่าน Backend เดิม
-      const response = await fetch('[https://api.line.me/v2/bot/message/push](https://api.line.me/v2/bot/message/push)', {
+      const response = await fetch('https://api.line.me/v2/bot/message/push', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
