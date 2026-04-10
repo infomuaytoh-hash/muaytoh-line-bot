@@ -1,15 +1,5 @@
 {
   "version": 2,
-  "builds": [
-    {
-      "src": "api/line.js",
-      "use": "@vercel/node"
-    },
-    {
-      "src": "api/cron-report.js",
-      "use": "@vercel/node"
-    }
-  ],
   "routes": [
     {
       "src": "/api/line",
@@ -18,12 +8,6 @@
     {
       "src": "/api/cron-report",
       "dest": "api/cron-report.js"
-    }
-  ],
-  "crons": [
-    {
-      "path": "/api/cron-report",
-      "schedule": "* * * * *"
     }
   ]
 }
