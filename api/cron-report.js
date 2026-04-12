@@ -13,7 +13,7 @@ if (!admin.apps.length) {
 
 const db = admin.firestore();
 
-// --- ฟังก์ชันกระจายข้อความ (ส่งทั้ง LINE และ Telegram) ---
+// --- ฟังก์ชันสำหรับส่ง Telegram และ LINE ---
 async function broadcastMessage(text, config) {
     const promises = [];
 
@@ -21,7 +21,7 @@ async function broadcastMessage(text, config) {
     const activeLineGroups = (config.lineGroups || []).filter(g => g.active);
     for (const group of activeLineGroups) {
         promises.push(
-            fetch('[https://api.line.me/v2/bot/message/push](https://api.line.me/v2/bot/message/push)', {
+            fetch('https://api.line.me/v2/bot/message/push', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
@@ -82,7 +82,6 @@ export default async function handler(req, res) {
 
       console.log(`[${brand.name}] ถึงเวลาส่งรายงานรอบ: ${matchedShift.name} (${currentTimeStr})`);
 
-      // ส่งตัวแปร matchedShift ไปประมวลผลแยกส่วน
       await generateAndSendModularReport(branchId, brand.name, config, matchedShift, bkkDate);
     }
 
@@ -94,7 +93,7 @@ export default async function handler(req, res) {
   }
 }
 
-// ฟังก์ชันคำนวณและส่งรายงานแบบ "แยกส่วน (Modular)"
+// ฟังก์ชันคำนวณ จัดกลุ่มหมวดหมู่ และวิเคราะห์พฤติกรรม
 async function generateAndSendModularReport(branchId, branchName, config, shift, bkkDate) {
   const BKK_OFFSET = 7 * 60 * 60 * 1000;
   const nowTime = new Date().getTime();
@@ -103,7 +102,6 @@ async function generateAndSendModularReport(branchId, branchName, config, shift,
   const startOfDayTimestamp = startOfDayBkkShifted - BKK_OFFSET; 
   const thirtyDaysAgo = nowTime - (30 * 86400000);
 
-  // ดึงข้อมูล Inventory & Transactions
   const invSnap = await db.collection(`artifacts/${branchId}/public/data/inventory`).get();
   const items = invSnap.docs.map(d => d.data());
   const activeItems = items.filter(i => i.isActive !== false);
@@ -121,15 +119,29 @@ async function generateAndSendModularReport(branchId, branchName, config, shift,
   const wasteMap = {};
   const salesTx = new Set();
   const activeItemsUsage = {};
+  
+  const lastUsedMap = {}; 
+  const usageStats30d = {};
 
-  // คำนวณข้อมูลย้อนหลัง 30 วัน (สำหรับทุนจม)
   allLogs.forEach(l => {
+      // หาวันที่เบิกล่าสุด (อัปเดต timestamp ให้ใหม่สุดเสมอ)
+      if (l.type === 'OUT' || l.type === 'PROD_OUT' || l.type === 'WASTE') {
+          if (!lastUsedMap[l.itemName] || l.timestamp > lastUsedMap[l.itemName].timestamp) {
+              lastUsedMap[l.itemName] = { date: l.date.split(' ')[0], timestamp: l.timestamp };
+          }
+          if (l.timestamp >= thirtyDaysAgo) {
+              activeItemsUsage[l.itemName] = true;
+          }
+      }
+
+      // นับสถิติการเบิก 30 วันย้อนหลัง
       if ((l.type === 'OUT' || l.type === 'PROD_OUT') && l.timestamp >= thirtyDaysAgo) {
-          activeItemsUsage[l.itemName] = true;
+          if (!usageStats30d[l.itemName]) usageStats30d[l.itemName] = { totalQty: 0, count: 0 };
+          usageStats30d[l.itemName].totalQty += parseFloat(l.qty) || 0;
+          usageStats30d[l.itemName].count += 1;
       }
   });
 
-  // คำนวณข้อมูลเฉพาะวันนี้ (สำหรับสรุปยอดและของเสีย)
   todayLogs.forEach(l => {
     const cost = parseFloat(l.qty) * (itemPriceMap[l.itemName] || 0);
     if (l.type === 'OUT') {
@@ -170,10 +182,18 @@ async function generateAndSendModularReport(branchId, branchName, config, shift,
   const branchHeader = `[📍 สาขา: ${branchName}]\n`;
   const modules = shift.modules && shift.modules.length > 0 ? shift.modules : ['summary', 'waste', 'restock', 'lowstock', 'deadstock'];
 
-  // ฟังก์ชันหน่วงเวลาเพื่อไม่ให้ API Block
   const delay = ms => new Promise(res => setTimeout(res, ms));
 
-  // --- เริ่มส่งรายงานทีละส่วนตามที่ตั้งค่า ---
+  // --- กำหนด Emoji ประจำหมวดหมู่ ---
+  const categoryEmojis = {
+      'เนื้อสัตว์/อาหารทะเล': '🥩',
+      'ผัก/ผลไม้': '🥬',
+      'ของแห้ง/เครื่องปรุง': '🧂',
+      'บรรจุภัณฑ์': '📦',
+      'วัตถุดิบปรุงสุก (Prep)': '🍳'
+  };
+
+  // --- เริ่มส่งรายงานทีละส่วน ---
 
   if (modules.includes('summary')) {
       const msgSummary = `${branchHeader}📊 [สรุปภาพรวมประจำวัน]\n📍 รอบ: ${shift.name}\n📅 วันที่: ${todayDate}\n\n🍽️ ยอดขายผ่านระบบ: ${totalSalesCount} จาน/รายการ\n📤 มูลค่าเบิกใช้รวม: ฿${totalUsageCost.toLocaleString('th-TH', {minimumFractionDigits:2, maximumFractionDigits:2})}`;
@@ -191,27 +211,89 @@ async function generateAndSendModularReport(branchId, branchName, config, shift,
   const urgentList = reorderList.filter(i => (i.qty || 0) <= 0);
   const normalList = reorderList.filter(i => (i.qty || 0) > 0);
 
+  // 🚨 รายการสั่งของด่วน (แยกตามหมวดหมู่)
   if (modules.includes('restock')) {
-      let msgUrgent = `${branchHeader}🚨 [รายการสั่งซื้อด่วน - สต็อกเป็น 0]\n\n`;
+      let msgUrgent = `${branchHeader}🚨 [รายการสั่งซื้อด่วน - สต็อกเป็น 0]\n`;
       if (urgentList.length > 0) {
           const urgentBudget = urgentList.reduce((acc, i) => acc + (i.suggest * (parseFloat(i.price) || 0)), 0);
-          urgentList.forEach(i => { msgUrgent += `- ${i.name}: +${i.suggest} ${i.unit} (฿${(i.suggest * (parseFloat(i.price) || 0)).toLocaleString('th-TH', {minimumFractionDigits:2, maximumFractionDigits:2})})\n`; });
-          msgUrgent += `\n💰 งบซื้อด่วน: ฿${urgentBudget.toLocaleString('th-TH', {minimumFractionDigits:2, maximumFractionDigits:2})}`;
+          
+          // เตรียมข้อมูลและเรียงลำดับความเร่งด่วน
+          const enhancedUrgent = urgentList.map(i => ({
+              ...i,
+              category: i.category || 'อื่นๆ',
+              lastUsedTS: lastUsedMap[i.name] ? lastUsedMap[i.name].timestamp : 0,
+              lastUsedDate: lastUsedMap[i.name] ? lastUsedMap[i.name].date : 'ไม่มีประวัติ',
+              stats: usageStats30d[i.name] || { totalQty: 0, count: 0 }
+          })).sort((a, b) => b.lastUsedTS - a.lastUsedTS);
+
+          // จัดกลุ่มตามหมวดหมู่
+          const groupedUrgent = {};
+          enhancedUrgent.forEach(i => {
+              if (!groupedUrgent[i.category]) groupedUrgent[i.category] = [];
+              groupedUrgent[i.category].push(i);
+          });
+
+          // สร้างข้อความแยกตามหมวดหมู่
+          for (const [cat, items] of Object.entries(groupedUrgent)) {
+              const icon = categoryEmojis[cat] || '📌';
+              msgUrgent += `\n${icon} [หมวด: ${cat}]\n`;
+
+              items.forEach(i => {
+                  const daysSinceUsed = i.lastUsedTS ? (nowTime - i.lastUsedTS) / (1000 * 60 * 60 * 24) : 999;
+                  let urgencyIcon = '⏳';
+                  let timeStr = 'ไม่ได้ใช้นานเกิน 3 วัน';
+
+                  if (daysSinceUsed <= 1) { urgencyIcon = '🔥'; timeStr = 'วันนี้'; }
+                  else if (daysSinceUsed <= 2) { urgencyIcon = '⚡️'; timeStr = 'เมื่อวาน'; }
+                  else if (daysSinceUsed <= 3) { urgencyIcon = '⚡️'; timeStr = `${Math.floor(daysSinceUsed)} วันที่แล้ว`; }
+                  else if (daysSinceUsed !== 999) { timeStr = `${Math.floor(daysSinceUsed)} วันที่แล้ว`; }
+
+                  const adu = i.stats.totalQty / 30; 
+                  const aduText = adu > 0 ? `ใช้วันละ ${adu.toLocaleString('th-TH', {maximumFractionDigits:1})} ${i.unit}` : 'ไม่ค่อยเบิกใช้';
+                  const freqText = i.stats.count > 0 ? `เบิก ${i.stats.count} ครั้ง/ด.` : 'ไม่มีเบิก 30 วัน';
+                  const itemCost = (i.suggest * (parseFloat(i.price) || 0)).toLocaleString('th-TH', {minimumFractionDigits:2, maximumFractionDigits:2});
+                  
+                  msgUrgent += `${urgencyIcon} ${i.name}: +${i.suggest} ${i.unit} (฿${itemCost})\n`;
+                  msgUrgent += `   🕒 เบิกล่าสุด: ${timeStr} (${i.lastUsedDate})\n`;
+                  msgUrgent += `   📊 พฤติกรรม: ${aduText} (${freqText})\n`;
+              });
+          }
+          
+          msgUrgent += `\n💰 งบซื้อด่วนรวม: ฿${urgentBudget.toLocaleString('th-TH', {minimumFractionDigits:2, maximumFractionDigits:2})}`;
       } else {
-          msgUrgent += `✅ ไม่มีรายการของหมดสต็อก`;
+          msgUrgent += `\n✅ ไม่มีรายการของหมดสต็อก`;
       }
       await broadcastMessage(msgUrgent, config);
       await delay(500);
   }
 
+  // 📉 แจ้งเตือนของใกล้หมด (แยกตามหมวดหมู่)
   if (modules.includes('lowstock')) {
-      let msgNormal = `${branchHeader}📉 [แจ้งเตือน - สต็อกถึงจุดต่ำสุด]\n\n`;
+      let msgNormal = `${branchHeader}📉 [แจ้งเตือน - สต็อกถึงจุดต่ำสุด]\n`;
       if (normalList.length > 0) {
           const normalBudget = normalList.reduce((acc, i) => acc + (i.suggest * (parseFloat(i.price) || 0)), 0);
-          normalList.forEach(i => { msgNormal += `- ${i.name}: +${i.suggest} ${i.unit} (฿${(i.suggest * (parseFloat(i.price) || 0)).toLocaleString('th-TH', {minimumFractionDigits:2, maximumFractionDigits:2})})\n`; });
+          
+          // จัดกลุ่มตามหมวดหมู่
+          const groupedNormal = {};
+          normalList.forEach(i => {
+              const cat = i.category || 'อื่นๆ';
+              if (!groupedNormal[cat]) groupedNormal[cat] = [];
+              groupedNormal[cat].push(i);
+          });
+
+          // สร้างข้อความแยกตามหมวดหมู่
+          for (const [cat, items] of Object.entries(groupedNormal)) {
+              const icon = categoryEmojis[cat] || '📌';
+              msgNormal += `\n${icon} [หมวด: ${cat}]\n`;
+              
+              items.forEach(i => { 
+                  const itemCost = (i.suggest * (parseFloat(i.price) || 0)).toLocaleString('th-TH', {minimumFractionDigits:2, maximumFractionDigits:2});
+                  msgNormal += `- ${i.name}: +${i.suggest} ${i.unit} (฿${itemCost})\n`; 
+              });
+          }
           msgNormal += `\n💰 งบประมาณคาดการณ์: ฿${normalBudget.toLocaleString('th-TH', {minimumFractionDigits:2, maximumFractionDigits:2})}`;
       } else {
-          msgNormal += `✅ สต็อกอื่นๆ อยู่ในเกณฑ์ปลอดภัย`;
+          msgNormal += `\n✅ สต็อกอื่นๆ อยู่ในเกณฑ์ปลอดภัย`;
       }
       await broadcastMessage(msgNormal, config);
       await delay(500);
@@ -221,7 +303,10 @@ async function generateAndSendModularReport(branchId, branchName, config, shift,
       let msgDead = `${branchHeader}🕸️ [รายงานทุนจม - ไม่เคลื่อนไหว 30 วัน]\n\n`;
       if (deadStockList.length > 0) {
           const deadBudget = deadStockList.reduce((acc, i) => acc + i.stockValue, 0);
-          deadStockList.forEach(i => { msgDead += `- ${i.name}: ค้าง ${i.qty} ${i.unit} (฿${i.stockValue.toLocaleString('th-TH', {minimumFractionDigits:2, maximumFractionDigits:2})})\n`; });
+          deadStockList.forEach(i => { 
+              const stockVal = i.stockValue.toLocaleString('th-TH', {minimumFractionDigits:2, maximumFractionDigits:2});
+              msgDead += `- ${i.name}: ค้าง ${i.qty} ${i.unit} (฿${stockVal})\n`; 
+          });
           msgDead += `\n💸 มูลค่าทุนจมรวม: ฿${deadBudget.toLocaleString('th-TH', {minimumFractionDigits:2, maximumFractionDigits:2})}`;
       } else {
           msgDead += `✅ คลังสินค้าลื่นไหล ไม่มีค้างสต็อก`;
