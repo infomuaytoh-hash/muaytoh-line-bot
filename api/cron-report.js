@@ -13,6 +13,26 @@ if (!admin.apps.length) {
 
 const db = admin.firestore();
 
+// --- ฟังก์ชันสำหรับส่ง Telegram (เพิ่มเข้ามาใหม่) ---
+async function sendTelegramMessage(botToken, chatId, message) {
+    try {
+        const response = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ chat_id: chatId, text: message })
+        });
+        if (!response.ok) {
+            const errorText = await response.text();
+            console.error(`Telegram Error for Chat ID ${chatId}:`, errorText);
+        } else {
+            console.log(`Telegram sent to ${chatId} successfully.`);
+        }
+    } catch (error) {
+        console.error(`Telegram Fetch Error for Chat ID ${chatId}:`, error);
+    }
+}
+// ---------------------------------------------
+
 export default async function handler(req, res) {
   // ตรวจสอบว่าเรียกมาจาก Vercel Cron/cron-job.org จริงๆ เพื่อความปลอดภัย
   if (req.headers.authorization !== `Bearer ${process.env.CRON_SECRET}`) {
@@ -62,7 +82,7 @@ export default async function handler(req, res) {
   }
 }
 
-// ฟังก์ชันสำหรับคำนวณและส่ง LINE
+// ฟังก์ชันสำหรับคำนวณและส่ง LINE / Telegram
 async function generateAndSendReport(branchId, branchName, config, shiftName, bkkDate) {
   
   // === [เวทมนตร์ 2] คำนวณหา timestamp เที่ยงคืนของประเทศไทยเป๊ะๆ ===
@@ -136,14 +156,14 @@ async function generateAndSendReport(branchId, branchName, config, shiftName, bk
   const year = bkkDate.getFullYear() + 543;
   const todayDate = `${day}/${month}/${year}`;
 
-  // === สร้างข้อความรายงาน ===
-  const message = `\n[📍 สาขา: ${branchName}]\n📊 สรุปรายงานรอบ: ${shiftName}\n📅 ประจำวันที่: ${todayDate}\n\n🍽️ ยอดขายผ่านระบบ: ${totalSalesCount} จาน/รายการ\n📤 ยอดเบิกใช้รวม: ฿${totalUsageCost.toLocaleString(undefined, {minimumFractionDigits:2})}\n🗑️ มูลค่าของเสียรวม: ฿${totalWasteCost.toLocaleString(undefined, {minimumFractionDigits:2})}\n🚨 ของเสียเยอะสุด: ${topWasteText}\n\n---\n📋 สรุปสั่งซื้อ${orderSummary}\n💰 งบสั่งซื้อที่ต้องเตรียม: ฿${restockBudget.toLocaleString(undefined, {minimumFractionDigits:2})}`;
+  // === สร้างข้อความรายงาน (บังคับทศนิยมสูงสุดแค่ 2 ตำแหน่ง) ===
+  const message = `\n[📍 สาขา: ${branchName}]\n📊 สรุปรายงานรอบ: ${shiftName}\n📅 ประจำวันที่: ${todayDate}\n\n🍽️ ยอดขายผ่านระบบ: ${totalSalesCount} จาน/รายการ\n📤 ยอดเบิกใช้รวม: ฿${totalUsageCost.toLocaleString('th-TH', {minimumFractionDigits:2, maximumFractionDigits:2})}\n🗑️ มูลค่าของเสียรวม: ฿${totalWasteCost.toLocaleString('th-TH', {minimumFractionDigits:2, maximumFractionDigits:2})}\n🚨 ของเสียเยอะสุด: ${topWasteText}\n\n---\n📋 สรุปสั่งซื้อ${orderSummary}\n💰 งบสั่งซื้อที่ต้องเตรียม: ฿${restockBudget.toLocaleString('th-TH', {minimumFractionDigits:2, maximumFractionDigits:2})}`;
 
   // === ยิงเข้า LINE ===
   const activeGroups = (config.lineGroups || []).filter(g => g.active);
   for (const group of activeGroups) {
     try {
-      const response = await fetch('https://api.line.me/v2/bot/message/push', {
+      const response = await fetch('[https://api.line.me/v2/bot/message/push](https://api.line.me/v2/bot/message/push)', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -160,5 +180,18 @@ async function generateAndSendReport(branchId, branchName, config, shiftName, bk
     } catch (err) {
       console.error(`Line API Error for ${group.name}:`, err);
     }
+  }
+
+  // === ยิงเข้า Telegram (เพิ่มใหม่) ===
+  const telegramToken = config.telegramToken || "";
+  const telegramGroups = config.telegramGroups || [];
+
+  if (telegramToken && telegramGroups.length > 0) {
+      for (const group of telegramGroups) {
+          if (group.active) {
+              sendTelegramMessage(telegramToken, group.id, message)
+                  .catch(err => console.error("Telegram send failed:", err));
+          }
+      }
   }
 }
